@@ -71,7 +71,7 @@ struct ColorPickerMenu: View {
 
                 if deviceManager.isSelectedDeviceRazer {
                     Picker("Mode", selection: $deviceManager.selectedRazerMode) {
-                        ForEach(DeviceManager.RazerModeSelection.allCases) { mode in
+                        ForEach(deviceManager.availableRazerModes) { mode in
                             Text(mode.title).tag(mode)
                         }
                     }
