@@ -21,6 +21,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         popover = NSPopover()
         popover?.contentViewController = NSHostingController(rootView: ColorPickerMenu())
         popover?.behavior = .transient
+        popover?.animates = true
+        popover?.contentSize = NSSize(width: 292, height: 360)
     }
     
     @objc func togglePopover(_ sender: NSStatusBarButton) {

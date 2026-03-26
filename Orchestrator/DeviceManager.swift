@@ -42,11 +42,18 @@ class DeviceManager: ObservableObject {
             switch self?.testDeviceAccess(g213) ?? .unavailable {
             case .writable:
                 detected[g213.name] = g213
-                DispatchQueue.main.async {
-                    self?.statusMessage = "Found: \(g213.name)"
-                }
             case .readableOnly:
                 readableOnlyNames.append(g213.name)
+            case .unavailable:
+                break
+            }
+
+            let fireflyV2 = RazerFireflyV2()
+            switch self?.testDeviceAccess(fireflyV2) ?? .unavailable {
+            case .writable:
+                detected[fireflyV2.name] = fireflyV2
+            case .readableOnly:
+                readableOnlyNames.append(fireflyV2.name)
             case .unavailable:
                 break
             }
@@ -79,8 +86,62 @@ class DeviceManager: ObservableObject {
             guard !self.colorFlushScheduled else { return }
 
             self.colorFlushScheduled = true
-            self.queue.asyncAfter(deadline: .now() + 0.03) { [weak self] in
+            self.queue.asyncAfter(deadline: .now() + 0.008) { [weak self] in
                 self?.flushPendingColorRequest()
+            }
+        }
+    }
+
+    func setAllDevicesMode(
+        logitech: (red: UInt8, green: UInt8, blue: UInt8),
+        razer: (red: UInt8, green: UInt8, blue: UInt8),
+        fallback: (red: UInt8, green: UInt8, blue: UInt8)
+    ) {
+        queue.async { [weak self] in
+            guard let self else { return }
+
+            var failures: [String] = []
+            var remaining = self.devices.count
+
+            guard remaining > 0 else {
+                DispatchQueue.main.async {
+                    self.statusMessage = "No devices found"
+                }
+                return
+            }
+
+            for (name, device) in self.devices {
+                let family = name.lowercased()
+                let rgb: (red: UInt8, green: UInt8, blue: UInt8)
+                let delay: TimeInterval
+
+                if family.contains("logitech") {
+                    rgb = logitech
+                    delay = 3.0
+                } else if family.contains("razer") {
+                    rgb = razer
+                    delay = 0
+                } else {
+                    rgb = fallback
+                    delay = 0
+                }
+
+                self.queue.asyncAfter(deadline: .now() + delay) {
+                    if !device.setColor(red: rgb.red, green: rgb.green, blue: rgb.blue) {
+                        failures.append(name)
+                    }
+
+                    remaining -= 1
+                    if remaining == 0 {
+                        DispatchQueue.main.async {
+                            if failures.isEmpty {
+                                self.statusMessage = "Applied mode to all devices"
+                            } else {
+                                self.statusMessage = "Mode failed on: \(failures.joined(separator: ", "))"
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -106,7 +167,7 @@ class DeviceManager: ObservableObject {
 
         if pendingColorRequest != nil {
             colorFlushScheduled = true
-            queue.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+            queue.asyncAfter(deadline: .now() + 0.004) { [weak self] in
                 self?.flushPendingColorRequest()
             }
         }
