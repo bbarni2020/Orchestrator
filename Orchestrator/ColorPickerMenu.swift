@@ -68,16 +68,6 @@ struct ColorPickerMenu: View {
                 }
                 .pickerStyle(.menu)
                 .frame(maxWidth: .infinity)
-
-                if deviceManager.isSelectedDeviceRazer {
-                    Picker("Mode", selection: $deviceManager.selectedRazerMode) {
-                        ForEach(deviceManager.availableRazerModes) { mode in
-                            Text(mode.title).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .frame(maxWidth: .infinity)
-                }
                 
                 Divider()
                 
@@ -134,10 +124,6 @@ struct ColorPickerMenu: View {
         }
         .onChange(of: deviceManager.selectedDevice) { _, _ in
             deviceManager.syncSelectedDeviceState()
-        }
-        .onChange(of: deviceManager.selectedRazerMode) { _, mode in
-            guard deviceManager.isSelectedDeviceRazer else { return }
-            deviceManager.applyRazerMode(mode)
         }
     }
     
