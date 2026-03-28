@@ -6,6 +6,7 @@ struct ColorPickerMenu: View {
     @State private var showColorPicker = false
     @State private var selectedColor = Color.green
     @State private var suppressNextSelectedColorWrite = false
+    @State private var selectedAllDevicesModeName: String?
 
     private let presets: [(name: String, color: Color)] = [
         ("Signal Red", Color(red: 0.98, green: 0.22, blue: 0.24)),
@@ -14,8 +15,7 @@ struct ColorPickerMenu: View {
         ("Royal", Color(red: 0.2, green: 0.35, blue: 1.0)),
         ("Amber", Color(red: 1.0, green: 0.67, blue: 0.14)),
         ("Rose", Color(red: 1.0, green: 0.2, blue: 0.6)),
-        ("White", .white),
-        ("Off", .black)
+        ("White", .white)
     ]
 
     private let grid = Array(repeating: GridItem(.flexible(minimum: 20, maximum: 60), spacing: 10), count: 4)
@@ -33,9 +33,16 @@ struct ColorPickerMenu: View {
             footer
         }
         .padding(12)
-        .frame(width: 272)
-        .background(Color(NSColor.windowBackgroundColor))
+        .frame(width: 286)
+        .background(
+            LinearGradient(
+                colors: [Color(NSColor.windowBackgroundColor), Color(NSColor.windowBackgroundColor).opacity(0.92)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
         .onChange(of: selectedColor) { _, newColor in
+            guard deviceManager.isDevicesEnabled else { return }
             if suppressNextSelectedColorWrite {
                 suppressNextSelectedColorWrite = false
                 return
@@ -43,8 +50,27 @@ struct ColorPickerMenu: View {
             let (r, g, b) = rgbFromColor(newColor)
             deviceManager.setDeviceColor(red: r, green: g, blue: b)
         }
+        .onReceive(deviceManager.$currentColor) { rgb in
+            let next = Color(
+                red: Double(rgb.red) / 255.0,
+                green: Double(rgb.green) / 255.0,
+                blue: Double(rgb.blue) / 255.0
+            )
+
+            if !colorsMatch(selectedColor, next) {
+                suppressNextSelectedColorWrite = true
+                selectedColor = next
+            }
+        }
         .onChange(of: deviceManager.selectedDevice) { _, _ in
             deviceManager.syncSelectedDeviceState()
+        }
+        .onChange(of: deviceManager.availableDevices) { _, devices in
+            guard deviceManager.isDevicesEnabled else { return }
+            guard !devices.isEmpty else { return }
+            guard let selectedModeName = selectedAllDevicesModeName else { return }
+            guard let mode = quickModes.first(where: { $0.name == selectedModeName }) else { return }
+            applyQuickModeToAllDevices(mode)
         }
         .animation(.easeInOut(duration: 0.16), value: selectedColor)
         .animation(.easeInOut(duration: 0.16), value: deviceManager.needsElevation)
@@ -143,6 +169,8 @@ struct ColorPickerMenu: View {
                     presetButton(preset)
                 }
             }
+            .disabled(!deviceManager.isDevicesEnabled)
+            .opacity(deviceManager.isDevicesEnabled ? 1.0 : 0.45)
 
             VStack(alignment: .leading, spacing: 8) {
                 Text("Modes")
@@ -158,6 +186,8 @@ struct ColorPickerMenu: View {
                     }
                 }
             }
+            .disabled(!deviceManager.isDevicesEnabled)
+            .opacity(deviceManager.isDevicesEnabled ? 1.0 : 0.45)
 
             VStack(alignment: .leading, spacing: 8) {
                 Text("Custom Color")
@@ -184,6 +214,8 @@ struct ColorPickerMenu: View {
                 )
                 .padding(12)
             }
+            .disabled(!deviceManager.isDevicesEnabled)
+            .opacity(deviceManager.isDevicesEnabled ? 1.0 : 0.45)
 
             VStack(alignment: .leading, spacing: 8) {
                 Text("All Devices Modes")
@@ -196,8 +228,34 @@ struct ColorPickerMenu: View {
                             applyQuickModeToAllDevices(mode)
                         }
                         .buttonStyle(PrimaryActionStyle(accent: modeColor(mode)))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .stroke(Color.primary.opacity(selectedAllDevicesModeName == mode.name ? 0.6 : 0.0), lineWidth: 1.2)
+                        }
                     }
                 }
+            }
+            .disabled(!deviceManager.isDevicesEnabled)
+            .opacity(deviceManager.isDevicesEnabled ? 1.0 : 0.45)
+
+            Divider()
+                .overlay(Color.primary.opacity(0.1))
+
+            HStack {
+                Text("All Devices Lighting")
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Toggle(
+                    "",
+                    isOn: Binding(
+                        get: { deviceManager.isDevicesEnabled },
+                        set: { deviceManager.setDevicesEnabled($0) }
+                    )
+                )
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
             }
         }
         .panelStyle()
@@ -218,15 +276,29 @@ struct ColorPickerMenu: View {
     }
 
     private var statusChip: some View {
-        Text(deviceManager.statusMessage == "Ready" ? "Live" : "Idle")
+        Text(statusLabel)
             .font(.system(size: 10, weight: .bold, design: .rounded))
                 .foregroundStyle(.primary)
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
             .background(
                 Capsule(style: .continuous)
-                    .fill(deviceManager.statusMessage == "Ready" ? selectedColor.opacity(0.24) : Color.primary.opacity(0.08))
+                    .fill(statusColor)
             )
+    }
+
+    private var statusLabel: String {
+        if !deviceManager.isDevicesEnabled {
+            return "Off"
+        }
+        return deviceManager.statusMessage == "Ready" ? "Live" : "Idle"
+    }
+
+    private var statusColor: Color {
+        if !deviceManager.isDevicesEnabled {
+            return Color.primary.opacity(0.12)
+        }
+        return deviceManager.statusMessage == "Ready" ? selectedColor.opacity(0.24) : Color.primary.opacity(0.08)
     }
 
     private func presetButton(_ preset: (name: String, color: Color)) -> some View {
@@ -301,6 +373,7 @@ struct ColorPickerMenu: View {
     }
 
     private func applyQuickModeToAllDevices(_ mode: QuickMode) {
+        selectedAllDevicesModeName = mode.name
         suppressNextSelectedColorWrite = true
         selectedColor = modeColor(mode)
         deviceManager.setAllDevicesMode(
@@ -362,12 +435,13 @@ private struct PrimaryActionStyle: ButtonStyle {
         configuration.label
             .font(.system(size: 12, weight: .semibold, design: .rounded))
             .foregroundStyle(.primary)
-            .padding(.vertical, 8)
+            .padding(.vertical, 7)
+            .padding(.horizontal, 4)
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .fill(
                         LinearGradient(
-                            colors: [accent.opacity(0.22), accent.opacity(0.15)],
+                            colors: [accent.opacity(0.26), accent.opacity(0.1)],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         )
@@ -381,12 +455,12 @@ private struct PrimaryActionStyle: ButtonStyle {
 private extension View {
     func panelStyle() -> some View {
         self
-            .padding(12)
+            .padding(11)
             .frame(maxWidth: .infinity)
-            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color.primary.opacity(0.1), lineWidth: 0.8)
             }
     }
 }
