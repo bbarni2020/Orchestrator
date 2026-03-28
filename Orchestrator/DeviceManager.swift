@@ -1,5 +1,7 @@
 import Foundation
 import Combine
+import AppKit
+import CoreGraphics
 
 class DeviceManager: ObservableObject {
     @Published var availableDevices: [String] = []
@@ -16,10 +18,21 @@ class DeviceManager: ObservableObject {
     private var knownDeviceColors: [String: (red: UInt8, green: UInt8, blue: UInt8)] = [:]
     private var savedDeviceColorsBeforePowerOff: [String: (red: UInt8, green: UInt8, blue: UInt8)] = [:]
     private let defaults = UserDefaults.standard
+    private var isScreenLocked = false
+    private var isScreenSaverActive = false
+    private var isLightingActive = true
+    private var distributedNotificationObservers: [NSObjectProtocol] = []
+    private var screenStateTimer: DispatchSourceTimer?
+    private var lastScreenSaverBlackoutEnforcement = Date.distantPast
+    private var lastScreenSaverStartDate: Date?
+    private var isScreenSaverLockSession = false
 
     private enum TransitionSpec {
         static let logitechSteps = 20
         static let logitechFrameDelayMicroseconds: useconds_t = 100_000
+        static let screenSaverBlackoutRefreshInterval: TimeInterval = 1.2
+        static let lockSessionStartWindow: TimeInterval = 4.0
+        static let screenSaverProcessGraceWindow: TimeInterval = 4.0
     }
 
     private enum DefaultsKey {
@@ -37,7 +50,15 @@ class DeviceManager: ObservableObject {
     init() {
         loadPersistedState()
         checkElevation()
+        setupScreenStateMonitoring()
         scanDevices()
+        queue.async { [weak self] in
+            self?.refreshDynamicScreenStateOnQueue()
+        }
+    }
+
+    deinit {
+        teardownScreenStateMonitoring()
     }
     
     func checkElevation() {
@@ -109,6 +130,7 @@ class DeviceManager: ObservableObject {
         queue.async { [weak self] in
             guard let self else { return }
             guard self.isDevicesEnabled else { return }
+            guard self.isLightingActive else { return }
             self.pendingColorRequest = (red, green, blue)
             guard !self.colorFlushScheduled else { return }
 
@@ -127,6 +149,7 @@ class DeviceManager: ObservableObject {
         queue.async { [weak self] in
             guard let self else { return }
             guard self.isDevicesEnabled else { return }
+            guard self.isLightingActive else { return }
 
             var failures: [String] = []
             var remaining = self.devices.count
@@ -227,16 +250,41 @@ class DeviceManager: ObservableObject {
             return
         }
 
+        DispatchQueue.main.async {
+            self.isDevicesEnabled = enabled
+            self.persistDevicesEnabled()
+        }
+
+        applyLightingPolicyOnQueue(fallbackColor: fallbackColor, manualEnabledOverride: enabled)
+    }
+
+    private func applyLightingPolicyOnQueue(
+        fallbackColor: (red: UInt8, green: UInt8, blue: UInt8),
+        manualEnabledOverride: Bool? = nil
+    ) {
+        let manualEnabled = manualEnabledOverride ?? isDevicesEnabled
+        let isNormalDesktopEnvironment = !isScreenLocked && !isScreenSaverActive
+        let shouldAllowLighting = !isScreenSaverActive && (isScreenLocked || isNormalDesktopEnvironment)
+        let shouldEnableHardwareLighting = manualEnabled && shouldAllowLighting
+
+        guard shouldEnableHardwareLighting != isLightingActive else {
+            if devices.isEmpty {
+                DispatchQueue.main.async {
+                    self.statusMessage = "No devices found"
+                }
+            }
+            return
+        }
+
         guard !devices.isEmpty else {
             DispatchQueue.main.async {
-                self.isDevicesEnabled = enabled
-                self.persistDevicesEnabled()
+                self.isLightingActive = shouldEnableHardwareLighting
                 self.statusMessage = "No devices found"
             }
             return
         }
 
-        if enabled {
+        if shouldEnableHardwareLighting {
             restoreAllDeviceColorsFromPowerOffState(fallbackColor: fallbackColor)
         } else {
             transitionAllDevicesToBlackAndSaveState(fallbackColor: fallbackColor)
@@ -270,18 +318,18 @@ class DeviceManager: ObservableObject {
         }
 
         DispatchQueue.main.async {
-            self.isDevicesEnabled = false
+            self.isLightingActive = false
             if let selected = self.selectedDevice, self.devices[selected] != nil {
                 self.currentColor = black
             }
-            self.persistDevicesEnabled()
             self.persistCurrentColor()
-            self.statusMessage = hadFailure ? "Power-off failed on some devices" : "Lighting off"
+            self.statusMessage = hadFailure ? "Power-off failed on some devices" : self.suspendedStatusMessage()
         }
     }
 
     private func restoreAllDeviceColorsFromPowerOffState(fallbackColor: (red: UInt8, green: UInt8, blue: UInt8)) {
         var hadFailure = false
+        var failedDeviceNames: [String] = []
 
         for (name, device) in devices {
             let target = savedDeviceColorsBeforePowerOff[name] ?? knownDeviceColors[name] ?? fallbackColor
@@ -303,17 +351,34 @@ class DeviceManager: ObservableObject {
                 knownDeviceColors[name] = target
             } else {
                 hadFailure = true
+                failedDeviceNames.append(name)
             }
+        }
+
+        if !failedDeviceNames.isEmpty {
+            usleep(180_000)
+            var unresolvedFailures: [String] = []
+            for name in failedDeviceNames {
+                guard let device = devices[name] else { continue }
+                let target = savedDeviceColorsBeforePowerOff[name] ?? knownDeviceColors[name] ?? fallbackColor
+                let recovered = sendColorWithRetries(device: device, red: target.red, green: target.green, blue: target.blue, attempts: 8)
+                if recovered {
+                    knownDeviceColors[name] = target
+                } else {
+                    unresolvedFailures.append(name)
+                }
+            }
+
+            hadFailure = !unresolvedFailures.isEmpty
         }
 
         savedDeviceColorsBeforePowerOff.removeAll(keepingCapacity: false)
 
         DispatchQueue.main.async {
-            self.isDevicesEnabled = true
+            self.isLightingActive = true
             if let selected = self.selectedDevice, let selectedColor = self.knownDeviceColors[selected] {
                 self.currentColor = selectedColor
             }
-            self.persistDevicesEnabled()
             self.persistCurrentColor()
             self.persistKnownDeviceColors()
             self.statusMessage = hadFailure ? "Restore failed on some devices" : "Lighting restored"
@@ -361,7 +426,7 @@ class DeviceManager: ObservableObject {
     private func applySavedStateToConnectedDevices() {
         guard !devices.isEmpty else { return }
 
-        if isDevicesEnabled {
+        if isLightingActive {
             for (name, device) in devices {
                 let target = knownDeviceColors[name] ?? currentColor
                 if sendColorWithRetries(device: device, red: target.red, green: target.green, blue: target.blue, attempts: 4) {
@@ -386,6 +451,171 @@ class DeviceManager: ObservableObject {
             self.persistCurrentColor()
             self.statusMessage = "Lighting off"
         }
+    }
+
+    private func setupScreenStateMonitoring() {
+        let center = DistributedNotificationCenter.default()
+
+        let lockObserver = center.addObserver(forName: NSNotification.Name("com.apple.screenIsLocked"), object: nil, queue: nil) { [weak self] _ in
+            self?.queue.async {
+                guard let self else { return }
+                self.isScreenLocked = true
+                if self.lastScreenSaverStartDate?.timeIntervalSinceNow ?? -.infinity > -TransitionSpec.lockSessionStartWindow {
+                    self.isScreenSaverLockSession = true
+                }
+                self.refreshDynamicScreenStateOnQueue()
+                self.applyLightingPolicyOnQueue(fallbackColor: self.currentColor)
+            }
+        }
+
+        let unlockObserver = center.addObserver(forName: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil, queue: nil) { [weak self] _ in
+            self?.queue.async {
+                guard let self else { return }
+                self.isScreenLocked = false
+                self.isScreenSaverLockSession = false
+                self.lastScreenSaverStartDate = nil
+                self.refreshDynamicScreenStateOnQueue()
+                self.applyLightingPolicyOnQueue(fallbackColor: self.currentColor)
+            }
+        }
+
+        let saverStartObserver = center.addObserver(forName: NSNotification.Name("com.apple.screensaver.didstart"), object: nil, queue: nil) { [weak self] _ in
+            self?.queue.async {
+                guard let self else { return }
+                self.lastScreenSaverStartDate = Date()
+                self.isScreenSaverActive = true
+                if self.isScreenLocked {
+                    self.isScreenSaverLockSession = true
+                }
+                self.applyLightingPolicyOnQueue(fallbackColor: self.currentColor)
+            }
+        }
+
+        let saverStopObserver = center.addObserver(forName: NSNotification.Name("com.apple.screensaver.didstop"), object: nil, queue: nil) { [weak self] _ in
+            self?.queue.async {
+                guard let self else { return }
+                if self.isScreenLocked && self.isScreenSaverLockSession {
+                    return
+                }
+                self.isScreenSaverActive = false
+                self.lastScreenSaverStartDate = nil
+                self.isScreenSaverLockSession = false
+                self.applyLightingPolicyOnQueue(fallbackColor: self.currentColor)
+            }
+        }
+
+        distributedNotificationObservers = [lockObserver, unlockObserver, saverStartObserver, saverStopObserver]
+
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 0.5, repeating: .milliseconds(500))
+        timer.setEventHandler { [weak self] in
+            self?.refreshDynamicScreenStateOnQueue()
+        }
+        screenStateTimer = timer
+        timer.resume()
+    }
+
+    private func teardownScreenStateMonitoring() {
+        let center = DistributedNotificationCenter.default()
+        for observer in distributedNotificationObservers {
+            center.removeObserver(observer)
+        }
+        distributedNotificationObservers.removeAll(keepingCapacity: false)
+        screenStateTimer?.cancel()
+        screenStateTimer = nil
+    }
+
+    private func refreshDynamicScreenStateOnQueue() {
+        let state = queryScreenSaverState()
+
+        if isScreenLocked && isScreenSaverLockSession {
+            if !isScreenSaverActive {
+                isScreenSaverActive = true
+                applyLightingPolicyOnQueue(fallbackColor: currentColor)
+            }
+            enforceScreenSaverBlackoutIfNeededOnQueue()
+            return
+        }
+
+        let saverNow = state.hasScreenSaverWindow || (state.hasScreenSaverProcess && isWithinScreenSaverProcessGraceWindow())
+        if saverNow != isScreenSaverActive {
+            isScreenSaverActive = saverNow
+            if saverNow {
+                if lastScreenSaverStartDate == nil {
+                    lastScreenSaverStartDate = Date()
+                }
+            } else {
+                lastScreenSaverStartDate = nil
+            }
+            applyLightingPolicyOnQueue(fallbackColor: currentColor)
+        }
+
+        if isScreenSaverActive {
+            enforceScreenSaverBlackoutIfNeededOnQueue()
+        }
+    }
+
+    private func enforceScreenSaverBlackoutIfNeededOnQueue() {
+        guard !devices.isEmpty else { return }
+        guard !isLightingActive else { return }
+
+        let now = Date()
+        guard now.timeIntervalSince(lastScreenSaverBlackoutEnforcement) >= TransitionSpec.screenSaverBlackoutRefreshInterval else {
+            return
+        }
+
+        lastScreenSaverBlackoutEnforcement = now
+
+        var hadFailure = false
+        for (_, device) in devices {
+            if !sendColorWithRetries(device: device, red: 0, green: 0, blue: 0, attempts: 2) {
+                hadFailure = true
+            }
+        }
+
+        DispatchQueue.main.async {
+            self.currentColor = (0, 0, 0)
+            self.persistCurrentColor()
+            if hadFailure {
+                self.statusMessage = "Power-off failed on some devices"
+            } else if self.isScreenSaverActive {
+                self.statusMessage = "Lighting off (screen saver)"
+            }
+        }
+    }
+
+    private func queryScreenSaverState() -> (hasScreenSaverWindow: Bool, hasScreenSaverProcess: Bool) {
+        let hasScreenSaverProcess = NSWorkspace.shared.runningApplications.contains { app in
+            let bundle = app.bundleIdentifier?.lowercased() ?? ""
+            let name = app.localizedName?.lowercased() ?? ""
+            let executable = app.executableURL?.lastPathComponent.lowercased() ?? ""
+            return bundle.contains("screensaver") || name.contains("screensaver") || executable.contains("screensaver") || bundle.contains("legacyscreensaver") || name.contains("legacyscreensaver") || executable.contains("legacyscreensaver")
+        }
+
+        guard let windowInfo = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
+            return (false, hasScreenSaverProcess)
+        }
+
+        let hasScreenSaverWindow = windowInfo.contains { window in
+            let owner = (window[kCGWindowOwnerName as String] as? String)?.lowercased() ?? ""
+            return owner.contains("screensaver") || owner.contains("legacyscreensaver")
+        }
+
+        return (hasScreenSaverWindow, hasScreenSaverProcess)
+    }
+
+    private func isWithinScreenSaverProcessGraceWindow() -> Bool {
+        guard let lastStart = lastScreenSaverStartDate else {
+            return false
+        }
+        return Date().timeIntervalSince(lastStart) <= TransitionSpec.screenSaverProcessGraceWindow
+    }
+
+    private func suspendedStatusMessage() -> String {
+        if isScreenSaverActive {
+            return "Lighting off (screen saver)"
+        }
+        return "Lighting off"
     }
 
     private func loadPersistedState() {
