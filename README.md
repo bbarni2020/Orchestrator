@@ -2,6 +2,15 @@
 
 Menu bar application for controlling RGB lighting on Logitech G213 and Razer peripheral devices via USB/HID on macOS.
 
+## Demo video
+
+<video width="100%" controls>
+  <source src="https://cdn.hackclub.com/019dea21-7135-7939-b2a2-dca36f323275/Video%20Compress%20IMG%200056%20from%20Orchestrator.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
+
+[Link](https://cdn.hackclub.com/019dea21-7135-7939-b2a2-dca36f323275/Video%20Compress%20IMG%200056%20from%20Orchestrator.mp4)
+
 ## Features
 
 - 8-color presets and custom color picker
